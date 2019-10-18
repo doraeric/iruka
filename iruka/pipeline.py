@@ -69,9 +69,36 @@ class JudgePipeline(object):
     def __del__(self):
         self._reset_state()
 
-    def pl_build(self, src, output, *, context: dict={}):
+    def pl_before_build(self, checker_code=None):
+        if not checker_code:
+            # FIXME: a better way to record special judge flag?
+            self._special = False
+            self.logger.debug('No checker passed in. Continue...')
+            return True
+
+        self._special = True
+
+        # FIXME: The path is also hardcoded in checker script :(
+        include_path = (Path(__file__).parent / '../include').absolute()
+        compile_checker_cmd = shlex.split(
+            'g++ -Wall -O2 -xc++ -o /run/shm/checker "-I{!s}" -'.format(include_path))
+        subp = subprocess.run(
+            compile_checker_cmd,
+            input=checker_code,
+            stderr=subprocess.PIPE,
+            check=True)
+        self.logger.debug('Checker compile result: %s', subp.stderr)
+
+        return (subp.returncode == 0)
+
+
+    def pl_build(self, preset, src, output, *, context: dict={}):
         # TODO: different preset
-        cmdline_tpl = 'g++ -Wall -O2 -fdiagnostics-color=always {CFLAGS} -o {output} {src}'
+        if preset == 'cpp':
+            cmdline_tpl = 'g++ -Wall -O2 -fdiagnostics-color=always {CFLAGS} -o {output} {src}'
+        else:
+            raise IrukaInternalError('Unsupported preset: "{}"'.format(preset))
+
         # shlex over string template is silly and dangerous
         # hopefully these interpolated strings are hardcoded for now :)
         context_quoted = _ctx_quote_if_not_empty(context)
@@ -100,7 +127,8 @@ class JudgePipeline(object):
 
             print(subp)
 
-        self.logger.info("Build finished after %dms", t.duration * 1000)
+        self.logger.info("Build finished after %dms with return code %d",
+            t.duration * 1000, subp.returncode)
 
         return (subp.returncode == 0)
 
@@ -154,7 +182,11 @@ class JudgePipeline(object):
         return subp
 
     def pl_check(self, test_files):
-        checker = importlib.import_module('iruka.checkers.tolerant_diff')
+        if self._special:
+            checker = importlib.import_module('iruka.checkers.hoj_special_judge')
+        else:
+            checker = importlib.import_module('iruka.checkers.tolerant_diff')
+
         inf, outf = test_files
 
         checker_input = checker_io_pb2.CheckerInput(
@@ -202,16 +234,24 @@ class JudgePipeline(object):
 
     def _process_nsjail_log(self, file):
         jail_report = {}
+        buf_full_log = []
 
         for ln in file:
             mat = re.match(r'\[S\]\[\d+?\] __STAT__:0 (?:\d+?:)?([\w]+)\s+=\s+(.*)', ln)
             if mat is None:
                 # TODO: triage the message to separate file
+                buf_full_log.append(ln)
                 # self.logger.debug('SANDBOX >>> %s', ln[:-1])
-                continue
-            jail_report[mat.group(1)] = mat.group(2)
+            else:
+                jail_report[mat.group(1)] = mat.group(2)
 
         self.logger.debug('captured stat dict:\n%s', pformat(jail_report))
+
+        if 'process_spawned' not in jail_report:
+            raise IrukaInternalError(
+                'nsjail fails to start up. Did you forget to initialize '
+                'cgroups?',
+                ''.join(buf_full_log))
 
         mandatory_keys = [
             'cgroup_memory_failcnt',
@@ -223,7 +263,8 @@ class JudgePipeline(object):
         for k in mandatory_keys:
             if k not in jail_report:
                 raise IrukaInternalError(
-                    'Cannot extract key "{}" from log, which is mandatory'.format(k))
+                    'Cannot extract key "{}" from log, which is mandatory.'.format(k),
+                    ''.join(buf_full_log))
 
         return jail_report
 

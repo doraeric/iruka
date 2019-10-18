@@ -32,13 +32,13 @@ def judgeSubmission(irukaClient, req):
 
     problem_id = submission.problem_id
 
-    if req.hoj_type != iruka_rpc_pb2.SubmissionRequest.REGULAR:
-        logger.warn('Only problems of type REGULAR are supported. Rejecting this request...')
-        yield iruka_rpc_pb2.SubmissionEvent(
-            ack=iruka_rpc_pb2.SubmissionAck(
-                id=req.id,
-                reject_reason=iruka_rpc_pb2.SubmissionAck.UNSUPPORTED_PROBLEM))
-        return
+    # if req.hoj_type != iruka_rpc_pb2.SubmissionRequest.REGULAR:
+    #     logger.warn('Only problems of type REGULAR are supported. Rejecting this request...')
+    #     yield iruka_rpc_pb2.SubmissionEvent(
+    #         ack=iruka_rpc_pb2.SubmissionAck(
+    #             id=req.id,
+    #             reject_reason=iruka_rpc_pb2.SubmissionAck.UNSUPPORTED_PROBLEM))
+    #     return
 
     yield iruka_rpc_pb2.SubmissionEvent(
         ack=iruka_rpc_pb2.SubmissionAck(id=req.id))
@@ -80,13 +80,23 @@ def judgeSubmission(irukaClient, req):
     with open(PATH_USERCODE, 'w') as f:
         f.write(submission.code)
         code_length = f.seek(0, os.SEEK_CUR)
-        logger.info('Written %d bytes to %s', code_length, PATH_USERCODE)
+    logger.info('Written %d bytes to %s', code_length, PATH_USERCODE)
+
+    if req.hoj_type == iruka_rpc_pb2.SubmissionRequest.SPECIAL_JUDGE:
+        # before build
+        checker_code = submission.files.get('checker.cpp', None)
+
+        if not checker_code:
+            raise IrukaInternalError('Special judge is specified but no "checker.cpp" present in files map.')
+
+        pipeline.pl_before_build(checker_code)
 
     # compile
     compile_ctx = {
         'CFLAGS': '-DONLINE_JUDGE',
     }
     build_success = pipeline.pl_build(
+        submission.build_preset,
         src=Path(PATH_USERCODE).relative_to(pipeline.cwd_build),
         output=PATH_PROGRAM,
         context=compile_ctx)
@@ -144,8 +154,10 @@ def judgeSubmission(irukaClient, req):
                 verdict = checker_out.verdict
                 if verdict == common_pb2.WA:
                     logger.info(color('===== WA  =====', fg='red', style='negative'))
-                else:
+                elif verdict == common_pb2.AC:
                     logger.info(color('===== AC  =====', fg='green', style='negative'))
+                else:
+                    logger.info(color('===== ??? =====', fg='white', style='negative'))
 
             pipeline.pl_sandbox_clean()
 
@@ -213,7 +225,8 @@ def requestJudge(irukaClient, submissionRequest):
 
             evt = iruka_rpc_pb2.SubmissionEvent(
                 exception=iruka_rpc_pb2.SubmissionException(
-                    message=str(err)))
+                    message=str(err),
+                    backtrace=err.details))
             yield evt
         except Exception as err:
             logger.exception('Unhandled exception when judging')
@@ -223,14 +236,17 @@ def requestJudge(irukaClient, submissionRequest):
             buf = io.StringIO()
             traceback.print_exc(file=buf)
 
-            msg = 'Uncaught exception occurs in client!\n{!s}\n{}'.format(
-                err, buf.getvalue())
+            msg = 'Uncaught exception occurs in client!\n{!s}'.format(
+                err)
 
             evt = iruka_rpc_pb2.SubmissionEvent(
                 exception=iruka_rpc_pb2.SubmissionException(
-                    message=msg))
+                    message=msg,
+                    backtrace=buf.getvalue(),
+                    fatal=True))
             yield evt
 
     ret = irukaClient.stub.ReportSubmission(extract(gen))
-    logging.info('--- Judge completes, report sent ---')
+    logging.info(
+        color('------ Judge completes, report sent ------', style='bold'))
     return ret
